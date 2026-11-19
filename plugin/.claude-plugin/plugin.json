@@ -1,0 +1,5 @@
+{
+  "name": "sequences",
+  "version": "0.1.0",
+  "description": "Step skills for the sequence runner. Loaded only by the runner through --plugin-dir."
+}

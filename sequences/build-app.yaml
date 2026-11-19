@@ -1,0 +1,44 @@
+name: build-app
+description: Spec, build and independently test a small app from a short brief, then stop for human approval.
+budget_usd: 6
+max_retries: 3
+steps:
+  - id: spec
+    skill: seq-spec
+    model: opus
+    max_turns: 20
+    max_budget_usd: 1.5
+    freeze: [spec.md, check.sh]
+    gate:
+      - files: [spec.md, features.json, check.sh]
+      - features_schema: true
+
+  - id: build
+    depends_on: [spec]
+    skill: seq-build
+    model: sonnet
+    max_turns: 40
+    max_budget_usd: 2
+    loop: {max_iterations: 8}
+    allowed_tools: [Read, Glob, Grep, Write, Edit, Bash]
+    gate:
+      - features_only: [built]
+      - bash: 'bash "$SEQ_RUN_DIR/check.sh"'
+      - all_built: true
+
+  - id: test
+    depends_on: [build]
+    skill: seq-test
+    model: opus
+    on_fail: build
+    max_turns: 40
+    max_budget_usd: 2
+    allowed_tools: [Read, Glob, Grep, Write, Edit, Bash]
+    gate:
+      - features_only: [passes]
+      - target_unchanged: true
+      - checklist: checklists/app-basics.yaml
+      - all_pass: true
+
+  - id: approve
+    wait: approval

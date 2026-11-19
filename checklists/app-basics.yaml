@@ -1,0 +1,21 @@
+# verify: "bash: <cmd>" is run by the runner itself in the target project.
+# verify: review is judged by the independent test step and recorded in results.json.
+items:
+  - id: APP-01
+    requirement: README.md exists and explains how to run and how to test
+    verify: 'bash: test -s README.md && grep -qi "test" README.md && grep -qi "run" README.md'
+  - id: APP-02
+    requirement: The automated test suite passes (check.sh)
+    verify: 'bash: bash "$SEQ_RUN_DIR/check.sh"'
+  - id: APP-03
+    requirement: Every feature in spec.md has at least one automated test
+    verify: review
+  - id: APP-04
+    requirement: No secrets or key files are committed
+    verify: 'bash: ! git ls-files | grep -Eiq "(^|/)(\.env(\..*)?|id_rsa|.*\.(pem|key)|.*secret.*|credentials.*\.json)$"'
+  - id: APP-05
+    requirement: .gitignore exists and the work is committed in git
+    verify: 'bash: test -s .gitignore && [ "$(git rev-list --count HEAD)" -ge 1 ]'
+  - id: APP-06
+    requirement: Bad input gives a clear error message, not a traceback
+    verify: review
