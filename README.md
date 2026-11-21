@@ -31,6 +31,7 @@ Status: v0, one shipped sequence (`build-app`), 73 unit tests, verified with liv
 - [Limitations](#limitations)
 - [Roadmap](#roadmap)
 - [Repository layout](#repository-layout)
+- [License](#license)
 
 ## Why this exists
 
@@ -477,3 +478,7 @@ tests/               unit tests and fake_claude.py
 docs/spike.md        what was measured about claude -p
 requirements.txt     pyyaml
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
