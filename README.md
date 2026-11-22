@@ -4,9 +4,11 @@ Saved, repeatable, multi-step Claude Code runs with gates the model cannot talk 
 
 A sequence is a YAML file that lists steps, for example `spec`, `build`, `test`, `approve`. A small Python runner executes each step as its own fresh `claude -p` call, checks the result with its own gate code, retries a failed step with the failure attached, enforces attempt and budget caps, and keeps all state in a folder on disk. A human approves before anything is declared finished.
 
+A step does not have to be a Claude call. A step can also run a shell command or a piece of Python directly, the way an n8n Execute Command or Code node does, with no model and no cost. Claude steps and code steps mix freely, and the same gates, retries and budget apply to both.
+
 The goal is not to make Claude run longer. The goal is a more predictable result on a hard job, end to end, without losing quality, context or time.
 
-Status: v0, one shipped sequence (`build-app`), 73 unit tests, verified with live runs. See [Limitations](#limitations).
+Status: v0, one shipped sequence (`build-app`), 120 unit tests, verified with live runs. See [Limitations](#limitations).
 
 ## Contents
 
@@ -20,6 +22,7 @@ Status: v0, one shipped sequence (`build-app`), 73 unit tests, verified with liv
 - [CLI reference](#cli-reference)
 - [The build-app sequence](#the-build-app-sequence)
 - [Writing a sequence](#writing-a-sequence)
+- [Command and code steps](#command-and-code-steps)
 - [Gates](#gates)
 - [Checklists](#checklists)
 - [Step skills](#step-skills)
@@ -288,17 +291,20 @@ steps:
 
 ### Step keys
 
-Each step has exactly one of `skill` or `wait`.
+Each step has exactly one of `skill`, `wait`, `run` or `python`.
 
 | Key | Meaning |
 |---|---|
 | `id` | Unique step name. |
 | `skill` | Name of a skill in the content home's `blocks/skills/` (or the bundled `plugin/skills/`). The prompt starts with `/sequences:<skill>`. |
 | `wait: approval` | Human approval step. No Claude call. |
+| `run` | A bash script, run directly. No Claude call, no cost. See [Command and code steps](#command-and-code-steps). |
+| `python` | A Python snippet, run directly with the runner's interpreter. No Claude call, no cost. |
+| `retries` | Extra attempts for a `run` or `python` step. Default 0, so a failing command is final, unless the step has `on_fail`: then it gets `max_retries` attempts in total. |
 | `model` | `opus`, `sonnet`, `haiku` or a full model id. |
 | `max_turns` | `--max-turns` for the call. Default 30. |
 | `max_budget_usd` | `--max-budget-usd` for the call, capped by what is left of the run budget. Default 2. |
-| `timeout_min` | Wall clock timeout for the call. Default 20. |
+| `timeout_min` | Wall clock timeout for the call. Default 20 for a Claude step, 10 for a `run` or `python` step. |
 | `allowed_tools` | Tools the step may use. Default `Read, Glob, Grep, Write, Edit`. |
 | `loop: {max_iterations: N}` | Attempt cap for this step, replacing `max_retries`. |
 | `on_fail` | Step to go back to when this step runs out of fixes, for example the `test` step uses `build`. Must name this or an earlier step. |
@@ -306,7 +312,66 @@ Each step has exactly one of `skill` or `wait`.
 | `freeze` | Plain file names in the run folder to copy aside after this step passes. Every later step is checked against the copies. |
 | `gate` | List of gates, one key per entry. |
 
-The runner validates the file before any Claude call: unique ids, one of `skill` or `wait`, known gate names, plain file names in `freeze`, and `depends_on` and `on_fail` pointing backward.
+The runner validates the file before any Claude call: unique ids, one step kind per step, non-empty `run` and `python` text, a valid `retries`, known gate names, plain file names in `freeze`, and `depends_on` and `on_fail` pointing backward.
+
+## Command and code steps
+
+A `run` step is a bash script. A `python` step is a Python snippet. Both run directly, with no Claude call, so they are fast, deterministic and free. Use them for the parts of a job that need no judgment: install dependencies, run a formatter, fetch data, transform a file, call a script, send a request.
+
+```yaml
+name: ship-check
+steps:
+  - id: install
+    run: |
+      python3 -m venv venv
+      ./venv/bin/pip install -r requirements.txt
+
+  - id: build
+    skill: seq-build                 # a Claude step
+
+  - id: test
+    run: ./venv/bin/python -m unittest discover -s tests
+    on_fail: build                   # failing tests go back to build, with the test output attached
+
+  - id: stats
+    python: |
+      import os
+      brief = os.environ["SEQ_BRIEF"]
+      print(len(brief.split()), "words in the brief")
+
+  - id: report
+    run: |
+      cat "$SEQ_OUT_STATS" > "$SEQ_RUN_DIR/report.txt"
+    gate:
+      - files: [report.txt]
+```
+
+Write the script as a YAML block scalar (`run: |`). A plain one-line value breaks on `: ` or ` #` inside the command.
+
+**What a step gets**
+
+| | |
+|---|---|
+| Working directory | The target folder. |
+| `SEQ_TARGET`, `SEQ_RUN_DIR` | Paths of the target and the run folder. |
+| `SEQ_BRIEF` | The brief, exactly as given. A brief over about 128 KB cannot go through the environment, and the step fails with a clear message. |
+| `SEQ_STEP`, `SEQ_ATTEMPT` | Step id and attempt number. |
+| `SEQ_OUT_<ID>` | Path of the stdout file of each earlier `run` or `python` step that has passed (steps before this one in the file only). The id is upper-cased and every character that is not a letter or digit becomes `_`, so `make-it` gives `SEQ_OUT_MAKE_IT`. Two command steps whose names collide this way are rejected at load time. |
+| Python imports | The target folder is on `PYTHONPATH`, so a snippet can `import` the project it is working on. |
+
+**Passing data between steps.** The stdout of a step that passed, gates included, is kept as `<run folder>/outputs/<id>.txt`. A later `run` or `python` step reads it through `SEQ_OUT_<ID>`. A Claude step reads the same file if its skill tells it to.
+
+**Pass and fail.** Exit code 0 passes. Anything else fails, and so does a timeout. A `run` script is executed with `bash -e -o pipefail`, so it stops at the first failing line. The failure message (exit code plus the last 40 lines of output) goes to `errors.md`, and when the step has `on_fail` it is put into the prompt of the step it goes back to. That is how a failing test run feeds a Claude fix step. Full stdout and stderr stay in `steps/<id>-<n>/stdout.txt` and `stderr.txt`, and the script itself in `command.sh` or `code.py`.
+
+**Attempts.** One attempt by default, because rerunning a deterministic command rarely helps. Set `retries: N` for a flaky one. A step with `on_fail` and no `retries` gets `max_retries` attempts, like a Claude step. For a command step the cap counts failed attempts only, so running again after a loop-back through it costs nothing. A loop still ends: every loop-back is caused by a failure, and each step's failure count is never reset (except by `resume`).
+
+**Gates and budget.** The step's `gate` list runs after the command, so a command that exits 0 but leaves the wrong files still fails. These steps cost $0.00 and are never blocked by an exhausted budget. A sequence made only of `run`, `python` and `wait` steps does not need the `claude` binary at all.
+
+**Timeouts.** `timeout_min` (default 10, any positive number). On timeout the whole process group is killed, so a command that started background processes does not leave them behind. A process that deliberately leaves the group (`setsid`) is not killed, and neither are background children of a step that exits normally.
+
+**Trust.** A `run` or `python` step is code that runs as you, with your environment, and the Claude deny list does not apply to it. Treat a sequence file with command steps like a Makefile: read it before running one you did not write. `list` marks such sequences with `[runs commands]`. The first line of every executed command goes to the changelog and the full script is kept in the step folder. `resume` reads the sequence file again, so editing a file between a stop and a resume changes what runs. The brief is passed in the environment, never pasted into the script, so `"$SEQ_BRIEF"` is safe even when the brief contains quotes or `$(...)`. Do not build a script by pasting the brief into it some other way.
+
+**Not included.** No `{{ }}` templating, no branching or conditions, and no structured items passed between steps. Data moves as text files.
 
 ## Gates
 
@@ -400,7 +465,9 @@ errors.md         every gate failure, per step and attempt
 decisions.md      assumptions the steps wrote down
 summary.md        human-readable result, rewritten at every stop
 frozen/           copies of frozen files
+outputs/<id>.txt  stdout of each successful run or python step
 steps/<id>-<n>/   prompt.md, result.json, gate.log, features.json snapshot
+                  (run and python steps: command.sh or code.py, stdout.txt, stderr.txt)
 ```
 
 `summary.md` ends every run. It lists status, cost against budget, the step table, feature counts and, for a blocked run, the last failure.
@@ -423,6 +490,7 @@ Measured on live runs: a todo CLI cost 0.66 USD, a word-count CLI that needed on
 - The brief is user text. It is written to a file and never placed in a shell command.
 - Run folder names are sanitised, so a sequence name cannot escape `.sequence/runs/`.
 - A sequence file and a step skill are prompts with tool access. Read them before running ones you did not write.
+- A `run` or `python` step is code that runs as you, outside the deny list. See [Command and code steps](#command-and-code-steps).
 - Nothing in v0 pushes, deploys or touches anything outside the target and the run folder.
 
 ## Testing
@@ -431,7 +499,7 @@ Measured on live runs: a todo CLI cost 0.66 USD, a word-count CLI that needed on
 ./venv/bin/python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-73 tests. They use `tests/fake_claude.py`, a stand-in binary driven by a scenario file, so they cost no tokens and need no login. They cover: gates passing and failing, retry and cap behaviour, budget exhaustion, a missing skill marker, tampering with `features.json`, `check.sh` and `results.json`, resume after a block and after an interrupt, the approval step with and without a terminal, bad input to the CLI, custom sequence files and path safety.
+120 tests. They use `tests/fake_claude.py`, a stand-in binary driven by a scenario file, so they cost no tokens and need no login. They cover: gates passing and failing, retry and cap behaviour, budget exhaustion, a missing skill marker, tampering with `features.json`, `check.sh` and `results.json`, resume after a block and after an interrupt, the approval step with and without a terminal, bad input to the CLI, custom sequence files and path safety, and command and code steps (environment, data passing, strict failure, retries, timeout and process cleanup, gates after a command, a command step looping back to a Claude step).
 
 Tests leave temporary folders under `/tmp/sequences-tests/`.
 

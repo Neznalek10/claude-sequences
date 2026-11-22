@@ -28,6 +28,9 @@ DEFAULT_DENY = [
     "Bash(git reset --hard:*)", "Bash(git clean:*)",
 ]
 DEFAULT_STEP_BUDGET = 2.0
+COMMAND_KINDS = ("run", "python")
+DEFAULT_COMMAND_TIMEOUT_MIN = 10
+TAIL_LINES = 40
 EXIT_CODES = {"done": 0, "blocked": 1, "awaiting_approval": 3, "interrupted": 130}
 
 
@@ -45,15 +48,64 @@ def find_claude() -> str:
     return str(max(found, key=version))
 
 
+def command_kind(step: dict) -> str | None:
+    return next((k for k in COMMAND_KINDS if k in step), None)
+
+
+def out_var(step_id: str) -> str:
+    return "SEQ_OUT_" + re.sub(r"\W", "_", step_id).upper()
+
+
+def shorten(text: str, limit: int = 3000) -> str:
+    """Keeps the start and the end: the end of command output holds the error."""
+    return text if len(text) <= limit else text[:300] + "\n[...]\n" + text[-(limit - 310):]
+
+
+def read_brief(run_dir: Path) -> str:
+    with (run_dir / "brief.md").open(newline="") as f:
+        text = f.read()
+    return text[:-1] if text.endswith("\n") else text
+
+
+def claude_for(seq: dict) -> str:
+    """The claude binary, looked up only when the sequence has a step that calls it."""
+    if not any("skill" in s for s in seq["steps"]):
+        return ""
+    claude = find_claude()
+    if not (shutil.which(claude) or Path(claude).is_file()):
+        raise ValueError(f"claude binary not found: {claude}")
+    return claude
+
+
 def validate(seq: dict) -> None:
     if not isinstance(seq, dict) or not seq.get("steps"):
         raise ValueError("sequence needs a non-empty `steps` list")
     seen: list[str] = []
+    out_vars: set[str] = set()
     for s in seq["steps"]:
+        if not isinstance(s, dict) or "id" not in s:
+            raise ValueError("every step must be a mapping with an `id`")
+        if not isinstance(s["id"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", s["id"]):
+            raise ValueError(f"step id {s['id']!r} must start with a letter or digit and use only letters, digits, _ . -")
         if s["id"] in seen:
             raise ValueError(f"duplicate step id {s['id']}")
-        if ("skill" in s) == ("wait" in s):
-            raise ValueError(f"step {s['id']} needs exactly one of `skill` or `wait`")
+        if sum(k in s for k in ("skill", "wait", *COMMAND_KINDS)) != 1:
+            raise ValueError(f"step {s['id']} needs exactly one of `skill`, `wait`, `run` or `python`")
+        kind = command_kind(s)
+        if kind and (not isinstance(s[kind], str) or not s[kind].strip()):
+            raise ValueError(f"step {s['id']}: `{kind}` must be a non-empty string")
+        if kind:
+            if out_var(s["id"]) in out_vars:
+                raise ValueError(f"step {s['id']}: its output variable {out_var(s['id'])} is already used by another step")
+            out_vars.add(out_var(s["id"]))
+        if "timeout_min" in s:
+            t = s["timeout_min"]
+            if isinstance(t, bool) or not isinstance(t, (int, float)) or not 0 < t < math.inf:
+                raise ValueError(f"step {s['id']}: `timeout_min` must be a positive number")
+        if "retries" in s:
+            retries = s["retries"]
+            if not kind or not isinstance(retries, int) or isinstance(retries, bool) or retries < 0:
+                raise ValueError(f"step {s['id']}: `retries` is a whole number >= 0 and only for `run` or `python` steps")
         freeze = s.get("freeze", [])
         if not isinstance(freeze, list) or any(not isinstance(f, str) or Path(f).name != f for f in freeze):
             raise ValueError(f"step {s['id']}: freeze must be a list of plain file names")
@@ -154,11 +206,87 @@ def make_prompt(step: dict, run_dir: Path, target: Path, attempt: int, last_fail
 
 
 def cap_for(seq: dict, step: dict) -> int:
-    return step.get("loop", {}).get("max_iterations") or seq.get("max_retries", 3)
+    loop = step.get("loop", {}).get("max_iterations")
+    if loop:
+        return loop
+    if command_kind(step):
+        if "retries" in step:
+            return 1 + step["retries"]
+        return seq.get("max_retries", 3) if step.get("on_fail") else 1
+    return seq.get("max_retries", 3)
+
+
+def tail_of(*paths: Path) -> str:
+    text = ""
+    for path in paths:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 20000))
+            text += f.read().decode(errors="replace") + "\n"
+    return "\n".join(text.strip().splitlines()[-TAIL_LINES:])
+
+
+def kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+
+
+def run_command(step: dict, kind: str, run_dir: Path, target: Path, sdir: Path, n: int, earlier: list[str]) -> dict:
+    """Run a `run` (bash) or `python` step directly, with no Claude call. Output goes to files
+    in the step folder, so a chatty command cannot fill memory, and a timeout kills the whole
+    process group. `earlier` lists the steps before this one: only their outputs are exported."""
+    result = {"subtype": "success", "is_error": False, "exit_code": 0, "total_cost_usd": 0.0, "result": ""}
+    timeout_s = step.get("timeout_min", DEFAULT_COMMAND_TIMEOUT_MIN) * 60
+    try:
+        code = step[kind] if step[kind].endswith("\n") else step[kind] + "\n"
+        script = sdir / ("command.sh" if kind == "run" else "code.py")
+        script.write_text(code)
+        argv = ["bash", "-e", "-o", "pipefail", str(script)] if kind == "run" else [sys.executable, str(script)]
+        env = {
+            **os.environ, "SEQ_RUN_DIR": str(run_dir), "SEQ_TARGET": str(target), "SEQ_STEP": step["id"],
+            "SEQ_ATTEMPT": str(n), "SEQ_BRIEF": read_brief(run_dir),
+        }
+        for step_id in earlier:
+            done = run_dir / "outputs" / f"{step_id}.txt"
+            if done.is_file():
+                env[out_var(step_id)] = str(done)
+        if kind == "python":
+            env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(target), os.environ.get("PYTHONPATH")]))
+        with (sdir / "stdout.txt").open("wb") as out, (sdir / "stderr.txt").open("wb") as err:
+            proc = subprocess.Popen(argv, cwd=target, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                    start_new_session=True)
+            try:
+                result["exit_code"] = proc.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                kill_group(proc)
+                result["exit_code"] = None
+            except BaseException:
+                kill_group(proc)
+                raise
+    except OSError as e:
+        result.update(subtype="error_start", is_error=True, exit_code=None, result=f"could not start: {e}")
+        return result
+    if result["exit_code"] is None:
+        result.update(subtype="timeout", is_error=True,
+                      result=f"timed out after {timeout_s:g}s\n{tail_of(sdir / 'stdout.txt', sdir / 'stderr.txt')}")
+    elif result["exit_code"] != 0:
+        result.update(subtype="error_exit", is_error=True,
+                      result=f"exit {result['exit_code']}\n{tail_of(sdir / 'stdout.txt', sdir / 'stderr.txt')}")
+    return result
+
+
+def count_of(step: dict, st: dict) -> int:
+    """What the attempt cap counts. A command step counts only its failures, so running again
+    after a loop-back costs nothing. The loop still ends: every loop-back is caused by a
+    failure, and failures are never reset (except by `resume`)."""
+    return st.get("failures", 0) if command_kind(step) else st["attempts"]
 
 
 def out_of_attempts(seq: dict, step: dict, st: dict) -> bool:
-    return st["attempts"] - st.get("cap_base", 0) >= cap_for(seq, step)
+    return count_of(step, st) - st.get("cap_base", 0) >= cap_for(seq, step)
 
 
 def attempt(seq: dict, state: dict, run_dir: Path, step: dict, claude: str) -> bool:
@@ -181,18 +309,28 @@ def attempt(seq: dict, state: dict, run_dir: Path, step: dict, claude: str) -> b
                 shutil.move(run_dir / "results.json", sdir / "results-before.json")
     if any("target_unchanged" in g for g in gates):
         (sdir / "target.txt").write_text(target_fingerprint(target))
-    prompt = make_prompt(step, run_dir, target, n, state["last_failure"])
-    (sdir / "prompt.md").write_text(prompt)
-    budget = min(step.get("max_budget_usd", DEFAULT_STEP_BUDGET), state["budget_usd"] - state["total_cost"])
-    result = call_claude(build_cmd(claude, seq, step, prompt, budget), target, step.get("timeout_min", 20) * 60)
+    kind = command_kind(step)
+    if kind:
+        first_line = step[kind].strip().splitlines()[0][:100]
+        with (run_dir / "changelog.md").open("a") as f:
+            f.write(f"- runner: step {step['id']} attempt {n} runs {kind}: {first_line}\n")
+        ids = [s["id"] for s in seq["steps"]]
+        result = run_command(step, kind, run_dir, target, sdir, n, ids[:ids.index(step["id"])])
+    else:
+        prompt = make_prompt(step, run_dir, target, n, state["last_failure"])
+        (sdir / "prompt.md").write_text(prompt)
+        budget = min(step.get("max_budget_usd", DEFAULT_STEP_BUDGET), state["budget_usd"] - state["total_cost"])
+        result = call_claude(build_cmd(claude, seq, step, prompt, budget), target, step.get("timeout_min", 20) * 60)
     (sdir / "result.json").write_text(json.dumps(result, indent=2))
     cost = float(result.get("total_cost_usd") or 0)
     st["cost"] += cost
     state["total_cost"] += cost
 
-    ctx = Ctx(run_dir, target, step["id"], n, step["skill"], sdir)
-    failures = run_gates(ctx, [{"skill_used": True}] + gates)
-    if failures and result.get("subtype") != "success":
+    ctx = Ctx(run_dir, target, step["id"], n, step.get("skill"), sdir)
+    failures = run_gates(ctx, ([] if kind else [{"skill_used": True}]) + gates)
+    if kind and result["subtype"] != "success":
+        failures.insert(0, f"[{kind}] {result['result']}")
+    elif failures and result.get("subtype") != "success":
         failures.insert(0, f"[claude] step ended with {result.get('subtype')}: {str(result.get('result'))[:300]}")
     if any(f.startswith("[features_only]") for f in failures) and (sdir / "features.json").is_file():
         shutil.copy(sdir / "features.json", run_dir / "features.json")
@@ -203,14 +341,21 @@ def attempt(seq: dict, state: dict, run_dir: Path, step: dict, claude: str) -> b
         for name in step.get("freeze", []):
             (run_dir / "frozen").mkdir(exist_ok=True)
             shutil.copy(run_dir / name, run_dir / "frozen" / name)
+        if kind:
+            (run_dir / "outputs").mkdir(exist_ok=True)
+            kept = run_dir / "outputs" / f"{step['id']}.txt"
+            kept.unlink(missing_ok=True)
+            shutil.copy(sdir / "stdout.txt", kept)
     (sdir / "gate.log").write_text("\n".join(failures) or "all gates passed")
     verdict = "ok" if not failures else "failed"
+    if kind and failures:
+        st["failures"] = st.get("failures", 0) + 1
     with (run_dir / "changelog.md").open("a") as f:
         f.write(f"- runner: step {step['id']} attempt {n} {verdict} (cost ${cost:.4f})\n")
     if failures:
         with (run_dir / "errors.md").open("a") as f:
             f.write(f"## {step['id']} attempt {n}\n" + "\n".join(failures) + "\n\n")
-    state["last_failure"] = "\n".join(failures)[:3000]
+    state["last_failure"] = shorten("\n".join(failures))
     return not failures
 
 
@@ -258,7 +403,7 @@ def prepare_resume(seq: dict, state: dict) -> None:
             continue
         stuck = state.get("status") == "blocked" and st["status"] == "failed"
         if stuck or out_of_attempts(seq, s, st):
-            st["cap_base"] = st["attempts"]
+            st["cap_base"] = count_of(s, st)
         back = s.get("on_fail")
         if stuck and back and back != s["id"]:
             for later in steps[index[back]:]:
@@ -323,7 +468,7 @@ def execute(seq: dict, state: dict, run_dir: Path, claude: str, input_fn=tty_inp
             st["status"] = "done"
             i += 1
             continue
-        if state["budget_usd"] - state["total_cost"] < 0.05:
+        if not command_kind(step) and state["budget_usd"] - state["total_cost"] < 0.05:
             return finish(seq, state, run_dir, "blocked", "budget exhausted")
         if out_of_attempts(seq, step, st):
             return finish(seq, state, run_dir, "blocked", f"step {step['id']} used all {cap_for(seq, step)} attempts")
@@ -350,7 +495,13 @@ def list_sequences() -> str:
     for root in reversed(content.roots()):
         for p in sorted((root / "sequences").glob("*.yaml")):
             seq = yaml.safe_load(p.read_text())
-            found[seq["name"]] = f"{seq['name']}: {seq.get('description', '')}\n    {p}"
+            steps = [s for s in seq.get("steps") or [] if isinstance(s, dict)]
+            label = f"{seq['name']}:"
+            if seq.get("description"):
+                label += f" {seq['description']}"
+            if any(command_kind(s) for s in steps):
+                label += " [runs commands]"
+            found[seq["name"]] = f"{label}\n    {p}"
     return "\n".join(found.values())
 
 
@@ -387,11 +538,9 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print((Path(args.run_dir) / "summary.md").read_text())
             return 0
-        claude = find_claude()
-        if not (shutil.which(claude) or Path(claude).is_file()):
-            raise ValueError(f"claude binary not found: {claude}")
         if args.cmd == "run":
             seq = load_sequence(args.name)
+            claude = claude_for(seq)
             run_dir, state = new_run(
                 seq, args.brief, Path(args.target).expanduser().resolve(), args.budget, str(sequence_path(args.name).resolve()))
             input_fn = tty_input
@@ -401,6 +550,7 @@ def main(argv: list[str] | None = None) -> int:
             seq = load_sequence(state.get("source") or state["name"])
             if set(state["steps"]) != {s["id"] for s in seq["steps"]}:
                 raise ValueError("run.json steps do not match the sequence file")
+            claude = claude_for(seq)
             check_budget(args.budget)
             if args.budget is not None:
                 state["budget_usd"] = args.budget
@@ -413,6 +563,8 @@ def main(argv: list[str] | None = None) -> int:
         emit({"event": "started", "run_dir": str(run_dir)})
     # A service stopping the runner (SIGTERM) leaves the run resumable, like Ctrl+C.
     signal.signal(signal.SIGTERM, _terminate)
+    if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:  # keep `nohup` working
+        signal.signal(signal.SIGHUP, _terminate)
     try:
         status = execute(seq, state, run_dir, claude, input_fn, quiet=args.json)
     except KeyboardInterrupt:
